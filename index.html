@@ -1,0 +1,286 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>FallCane 모니터</title>
+<style>
+  :root { --bg:#0f1115; --card:#1a1d24; --fg:#e8eaed; --mut:#9aa0a6; --ok:#34c759; --err:#ff453a; --acc:#4da3ff; --tilt:#ffb340; }
+  * { box-sizing:border-box; }
+  body { margin:0; font-family:system-ui,-apple-system,"Noto Sans KR",sans-serif; background:var(--bg); color:var(--fg); padding:16px; }
+  header { display:flex; justify-content:space-between; align-items:center; margin-bottom:12px; }
+  h1 { font-size:20px; margin:0; }
+  #status { font-size:13px; padding:4px 10px; border-radius:999px; background:#333; color:var(--mut); }
+  #status.ok { background:rgba(52,199,89,.15); color:var(--ok); }
+  #status.err { background:rgba(255,69,58,.15); color:var(--err); }
+  .btns { display:grid; grid-template-columns:repeat(3,1fr); gap:8px; margin-bottom:12px; }
+  button { font:inherit; font-size:15px; padding:12px 8px; border:0; border-radius:12px; background:#2b2f38; color:var(--fg); }
+  button.primary { background:var(--acc); color:#fff; font-weight:600; }
+  button:disabled { opacity:.4; }
+  .cards { display:grid; grid-template-columns:repeat(3,1fr); gap:8px; margin-bottom:12px; }
+  .card { background:var(--card); border-radius:12px; padding:10px; }
+  .card .k { font-size:12px; color:var(--mut); }
+  .card .v { font-size:22px; font-weight:600; font-variant-numeric:tabular-nums; }
+  canvas { width:100%; height:200px; background:var(--card); border-radius:12px; display:block; }
+  .legend { font-size:12px; color:var(--mut); margin:6px 2px 12px; }
+  .legend b { display:inline-block; width:10px; height:3px; vertical-align:middle; margin:0 4px 0 8px; }
+  .settings { background:var(--card); border-radius:12px; padding:12px; margin-bottom:12px; }
+  .settings label { display:block; font-size:14px; margin:6px 0; }
+  .settings input { width:100%; }
+  .hint { font-size:12px; color:var(--mut); }
+  #log { list-style:none; padding:0; margin:0; font-size:13px; color:var(--mut); max-height:160px; overflow:auto; }
+  #log li { padding:4px 0; border-bottom:1px solid #222; }
+  #alarm { position:fixed; inset:0; background:rgba(200,20,20,.96); display:flex; flex-direction:column; align-items:center; justify-content:center; gap:16px; z-index:10; animation:flash 1s infinite; }
+  #alarm[hidden] { display:none; }
+  #alarm .big { font-size:44px; font-weight:800; }
+  #alarm button { background:#fff; color:#c00; font-size:20px; font-weight:700; padding:16px 40px; }
+  @keyframes flash { 50% { background:rgba(130,0,0,.96); } }
+</style>
+</head>
+<body>
+<header>
+  <h1>🦯 FallCane 모니터</h1>
+  <span id="status">연결 안 됨</span>
+</header>
+
+<div class="btns">
+  <button id="connect" class="primary">연결</button>
+  <button id="calib" disabled>기준 자세</button>
+  <button id="test">알림 테스트</button>
+</div>
+
+<div class="cards">
+  <div class="card"><div class="k">가속도 |a|</div><div class="v" id="vA">–</div></div>
+  <div class="card"><div class="k">기울기</div><div class="v" id="vT">–</div></div>
+  <div class="card"><div class="k">수신율</div><div class="v" id="vR">–</div></div>
+</div>
+
+<canvas id="chart"></canvas>
+<div class="legend"><b style="background:var(--acc)"></b>|a| (0–6 g) <b style="background:var(--tilt)"></b>기울기 (0–180°) <b style="background:var(--err)"></b>충격 기준</div>
+
+<div class="settings">
+  <label>충격 기준: <span id="lImp"></span> g
+    <input id="sImp" type="range" min="1.5" max="6" step="0.1" value="2.5"></label>
+  <label>쓰러짐 기울기 기준: <span id="lTilt"></span>°
+    <input id="sTilt" type="range" min="30" max="90" step="5" value="60"></label>
+  <div class="hint">충격 후 3초 안에 지팡이가 기준 이상 기울어진 상태로 1초 넘게 유지되면 낙상으로 판단합니다. 연결 직후 1초 동안의 자세가 기준(세운 상태)으로 잡히며, "기준 자세"로 다시 잡을 수 있습니다.</div>
+</div>
+
+<ul id="log"></ul>
+
+<div id="alarm" hidden>
+  <div class="big">⚠️ 낙상 감지!</div>
+  <div id="alarmInfo"></div>
+  <button id="ack">확인</button>
+</div>
+
+<script>
+const NUS_SERVICE = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
+const NUS_TX      = '6e400003-b5a3-f393-e0a9-e50e24dcca9e'; // 기기 → 휴대폰 (notify)
+
+const $ = id => document.getElementById(id);
+let device = null, swReg = null, actx = null, wakeLock = null, beepTimer = null;
+
+// 서비스 워커: Android Chrome에서 시스템 알림을 띄우려면 필요
+if ('serviceWorker' in navigator) {
+  navigator.serviceWorker.register('sw.js').then(r => swReg = r).catch(() => {});
+}
+
+// ---------- 설정 ----------
+let impactTh = +$('sImp').value, tiltTh = +$('sTilt').value;
+const syncLabels = () => { $('lImp').textContent = impactTh.toFixed(1); $('lTilt').textContent = tiltTh; };
+$('sImp').oninput  = e => { impactTh = +e.target.value; syncLabels(); };
+$('sTilt').oninput = e => { tiltTh = +e.target.value; syncLabels(); };
+syncLabels();
+
+// ---------- 상태 ----------
+const N = 300;                       // 그래프에 보이는 샘플 수 (약 6초)
+const histA = new Float32Array(N), histT = new Float32Array(N);
+let head = 0, rxCount = 0;
+let ref = null, refSum = [0,0,0], refN = 0;
+let lp = null;                       // 저역통과 필터를 거친 가속도 (기울기 계산용)
+let impactAt = -1, peakA = 0, tiltSince = -1, lastAlarm = 0;
+
+function setStatus(text, cls = '') { $('status').textContent = text; $('status').className = cls; }
+function log(msg) {
+  const li = document.createElement('li');
+  li.textContent = new Date().toLocaleTimeString('ko-KR') + '  ' + msg;
+  $('log').prepend(li);
+}
+
+// ---------- BLE 연결 ----------
+$('connect').onclick = async () => {
+  if (!navigator.bluetooth) {
+    alert('이 브라우저는 Web Bluetooth를 지원하지 않습니다.\nAndroid에서는 Chrome을, iPhone에서는 Bluefy 앱을 사용하세요.');
+    return;
+  }
+  // 사용자가 버튼을 누른 순간에만 허용되는 것들을 여기서 준비
+  if (!actx) try { actx = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) {}
+  if ('Notification' in window && Notification.permission === 'default') {
+    try { await Notification.requestPermission(); } catch (e) {}
+  }
+  try {
+    device = await navigator.bluetooth.requestDevice({
+      filters: [{ namePrefix: 'FallCane' }],
+      optionalServices: [NUS_SERVICE]
+    });
+    device.addEventListener('gattserverdisconnected', onDisconnected);
+    await connectGatt();
+  } catch (e) {
+    setStatus('연결 실패', 'err'); log('연결 실패: ' + e.message);
+  }
+};
+
+async function connectGatt() {
+  setStatus('연결 중…');
+  const server = await device.gatt.connect();
+  const svc = await server.getPrimaryService(NUS_SERVICE);
+  const tx = await svc.getCharacteristic(NUS_TX);
+  tx.addEventListener('characteristicvaluechanged', onData);
+  await tx.startNotifications();
+  ref = null; refSum = [0,0,0]; refN = 0; lp = null;
+  setStatus('연결됨', 'ok'); $('calib').disabled = false;
+  log(device.name + ' 연결됨');
+  try { wakeLock = await navigator.wakeLock.request('screen'); } catch (e) {}
+}
+
+async function onDisconnected() {
+  setStatus('연결 끊김', 'err'); $('calib').disabled = true;
+  log('연결 끊김 — 재연결 시도');
+  for (let i = 0; i < 5; i++) {
+    await new Promise(r => setTimeout(r, 2000));
+    try { await connectGatt(); return; } catch (e) {}
+  }
+  log('재연결 실패. "연결"을 다시 눌러주세요.');
+  notify('FallCane 연결 끊김', '지팡이와의 블루투스 연결이 끊어졌습니다.');
+}
+
+// ---------- 패킷 해석 (16바이트, little-endian) ----------
+function onData(e) {
+  const v = e.target.value;
+  if (v.byteLength < 16) return;
+  const ax = v.getInt16(4, true) / 1000, ay = v.getInt16(6, true) / 1000, az = v.getInt16(8, true) / 1000;
+  // 자이로(°/s): v.getInt16(10/12/14, true) / 10 — 필요하면 사용
+  rxCount++;
+
+  const a = Math.hypot(ax, ay, az);
+  if (!lp) lp = [ax, ay, az];
+  else { const k = 0.15; lp = [lp[0] + k*(ax-lp[0]), lp[1] + k*(ay-lp[1]), lp[2] + k*(az-lp[2])]; }
+
+  // 연결 직후 50샘플(약 1초) 평균을 "세운 상태" 기준으로 사용
+  if (!ref) {
+    refSum[0] += ax; refSum[1] += ay; refSum[2] += az;
+    if (++refN >= 50) { ref = refSum.map(s => s / refN); log('기준 자세 설정됨'); }
+  }
+  const tilt = ref ? angleDeg(ref, lp) : 0;
+
+  detect(a, tilt);
+  histA[head] = a; histT[head] = tilt; head = (head + 1) % N;
+  $('vA').textContent = a.toFixed(2) + 'g';
+  $('vT').textContent = Math.round(tilt) + '°';
+}
+
+function angleDeg(u, w) {
+  const d = u[0]*w[0] + u[1]*w[1] + u[2]*w[2];
+  const m = Math.hypot(...u) * Math.hypot(...w);
+  if (m === 0) return 0;
+  return Math.acos(Math.max(-1, Math.min(1, d / m))) * 180 / Math.PI;
+}
+
+$('calib').onclick = () => { if (lp) { ref = lp.slice(); log('기준 자세 다시 설정'); } };
+
+// ---------- 낙상 판단: 충격 → 3초 내 쓰러짐 1초 유지 ----------
+function detect(a, tilt) {
+  const t = performance.now();
+  if (a >= impactTh) {
+    if (impactAt < 0) peakA = 0;
+    impactAt = t; peakA = Math.max(peakA, a);
+  }
+  if (impactAt >= 0 && t - impactAt < 3000) {
+    if (tilt >= tiltTh) {
+      if (tiltSince < 0) tiltSince = t;
+      if (t - tiltSince >= 1000) triggerFall(peakA, tilt);
+    } else tiltSince = -1;
+  } else { impactAt = -1; tiltSince = -1; }
+}
+
+function triggerFall(peak, tilt) {
+  const t = performance.now();
+  impactAt = -1; tiltSince = -1;
+  if (t - lastAlarm < 10000) return;     // 10초 내 중복 알림 방지
+  lastAlarm = t;
+  const time = new Date().toLocaleTimeString('ko-KR');
+  const info = `${time} · 최대 충격 ${peak.toFixed(1)}g · 기울기 ${Math.round(tilt)}°`;
+  log('낙상 감지 — ' + info);
+  showAlarm(info);
+  notify('⚠️ 낙상 감지!', info);
+}
+
+// ---------- 알림 ----------
+function notify(title, body) {
+  if (!('Notification' in window) || Notification.permission !== 'granted') return;
+  const opt = { body, tag: 'fallcane', renotify: true, requireInteraction: true, vibrate: [500,200,500,200,500] };
+  if (swReg) swReg.showNotification(title, opt).catch(() => {});
+  else try { new Notification(title, opt); } catch (e) {}
+}
+
+function showAlarm(info) {
+  $('alarmInfo').textContent = info;
+  $('alarm').hidden = false;
+  if (navigator.vibrate) navigator.vibrate([800, 300, 800, 300, 800]);
+  beep(); clearInterval(beepTimer); beepTimer = setInterval(beep, 2000);
+}
+$('ack').onclick = () => {
+  $('alarm').hidden = true; clearInterval(beepTimer);
+  if (navigator.vibrate) navigator.vibrate(0);
+};
+
+function beep() {
+  if (!actx) return;
+  if (actx.state === 'suspended') actx.resume();
+  const o = actx.createOscillator(), g = actx.createGain();
+  o.type = 'square'; o.frequency.value = 880; g.gain.value = 0.15;
+  o.connect(g).connect(actx.destination);
+  o.start(); o.stop(actx.currentTime + 1);
+}
+
+$('test').onclick = async () => {
+  if (!actx) try { actx = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) {}
+  if ('Notification' in window && Notification.permission === 'default') await Notification.requestPermission();
+  lastAlarm = 0;
+  triggerFall(3.2, 85);
+};
+
+// ---------- 수신율 ----------
+setInterval(() => { $('vR').textContent = rxCount + 'Hz'; rxCount = 0; }, 1000);
+
+// ---------- 그래프 ----------
+const cv = $('chart'), ctx = cv.getContext('2d');
+function draw() {
+  const dpr = window.devicePixelRatio || 1, W = cv.clientWidth, H = cv.clientHeight;
+  if (cv.width !== W * dpr) { cv.width = W * dpr; cv.height = H * dpr; }
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, W, H);
+  ctx.strokeStyle = '#2a2e36'; ctx.lineWidth = 1;
+  for (let g = 1; g < 6; g++) { const y = H - g / 6 * H; ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(W, y); ctx.stroke(); }
+  // 충격 기준선
+  ctx.strokeStyle = '#ff453a'; ctx.setLineDash([5, 4]);
+  const yTh = H - impactTh / 6 * H; ctx.beginPath(); ctx.moveTo(0, yTh); ctx.lineTo(W, yTh); ctx.stroke();
+  ctx.setLineDash([]);
+  line(histT, 180, '#ffb340');
+  line(histA, 6, '#4da3ff');
+  requestAnimationFrame(draw);
+
+  function line(arr, max, color) {
+    ctx.strokeStyle = color; ctx.lineWidth = 2; ctx.beginPath();
+    for (let i = 0; i < N; i++) {
+      const v = arr[(head + i) % N], x = i / (N - 1) * W, y = H - Math.min(v / max, 1) * H;
+      i ? ctx.lineTo(x, y) : ctx.moveTo(x, y);
+    }
+    ctx.stroke();
+  }
+}
+draw();
+</script>
+</body>
+</html>
