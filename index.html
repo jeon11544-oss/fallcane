@@ -7,6 +7,7 @@
 <style>
   :root { --bg:#0f1115; --card:#1a1d24; --fg:#e8eaed; --mut:#9aa0a6; --ok:#34c759; --err:#ff453a; --acc:#4da3ff; --tilt:#ffb340; }
   * { box-sizing:border-box; }
+  [hidden] { display:none !important; }
   body { margin:0; font-family:system-ui,-apple-system,"Noto Sans KR",sans-serif; background:var(--bg); color:var(--fg); padding:16px; }
   header { display:flex; justify-content:space-between; align-items:center; margin-bottom:12px; }
   h1 { font-size:20px; margin:0; }
@@ -55,10 +56,16 @@
   <div class="card"><div class="k">수신율</div><div class="v" id="vR">–</div></div>
 </div>
 
+<div class="cards" id="devCards" hidden>
+  <div class="card"><div class="k">판정 상태</div><div class="v" id="vS" style="font-size:18px">–</div></div>
+  <div class="card"><div class="k">압력</div><div class="v" id="vP">–</div></div>
+  <div class="card"><div class="k">손잡이</div><div class="v" id="vG">–</div></div>
+</div>
+
 <canvas id="chart"></canvas>
 <div class="legend"><b style="background:var(--acc)"></b>|a| (0–6 g) <b style="background:var(--tilt)"></b>기울기 (0–180°) <b style="background:var(--err)"></b>충격 기준</div>
 
-<div class="settings">
+<div class="settings" id="settings">
   <label>충격 기준: <span id="lImp"></span> g
     <input id="sImp" type="range" min="1.5" max="6" step="0.1" value="2.5"></label>
   <label>쓰러짐 기울기 기준: <span id="lTilt"></span>°
@@ -77,6 +84,9 @@
 <script>
 const NUS_SERVICE = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
 const NUS_TX      = '6e400003-b5a3-f393-e0a9-e50e24dcca9e'; // 기기 → 휴대폰 (notify)
+const NUS_RX      = '6e400002-b5a3-f393-e0a9-e50e24dcca9e'; // 휴대폰 → 기기 (write)
+const STATE_KO = ['평상', '충격 감지', '확인 중', '경보'];
+let rxChar = null, deviceMode = false, prevDevState = 0;
 
 const $ = id => document.getElementById(id);
 let device = null, swReg = null, actx = null, wakeLock = null, beepTimer = null;
@@ -138,6 +148,7 @@ async function connectGatt() {
   const tx = await svc.getCharacteristic(NUS_TX);
   tx.addEventListener('characteristicvaluechanged', onData);
   await tx.startNotifications();
+  try { rxChar = await svc.getCharacteristic(NUS_RX); } catch (e) { rxChar = null; }
   ref = null; refSum = [0,0,0]; refN = 0; lp = null;
   setStatus('연결됨', 'ok'); $('calib').disabled = false;
   log(device.name + ' 연결됨');
@@ -164,6 +175,25 @@ function onData(e) {
   rxCount++;
 
   const a = Math.hypot(ax, ay, az);
+
+  // 20바이트 패킷 = 지팡이가 직접 낙상을 판정하는 펌웨어
+  if (v.byteLength >= 20) {
+    if (!deviceMode) enterDeviceMode();
+    const pressure = v.getUint16(16, true), st = v.getUint8(18), tilt = v.getUint8(19);
+    const s = st & 0x0f, grip = !!(st & 0x10), enabled = !!(st & 0x20);
+    $('vS').textContent = enabled ? (STATE_KO[s] || '?') : '임계값 미설정';
+    $('vS').style.color = s === 3 ? 'var(--err)' : s ? 'var(--tilt)' : enabled ? 'var(--ok)' : 'var(--mut)';
+    $('vP').textContent = pressure;
+    $('vG').textContent = grip ? '잡음' : '놓음';
+    if (s === 3 && prevDevState !== 3) raiseAlarm(`${new Date().toLocaleTimeString('ko-KR')} · 지팡이 낙상 판정 · 기울기 ${tilt}° · 압력 ${pressure}`);
+    if (s !== 3 && prevDevState === 3) clearAlarmUI();
+    if (s !== prevDevState) log('상태: ' + (STATE_KO[prevDevState] || '?') + ' → ' + (STATE_KO[s] || '?'));
+    prevDevState = s;
+    histA[head] = a; histT[head] = tilt; head = (head + 1) % N;
+    $('vA').textContent = a.toFixed(2) + 'g';
+    $('vT').textContent = tilt + '°';
+    return;
+  }
   if (!lp) lp = [ax, ay, az];
   else { const k = 0.15; lp = [lp[0] + k*(ax-lp[0]), lp[1] + k*(ay-lp[1]), lp[2] + k*(az-lp[2])]; }
 
@@ -210,10 +240,20 @@ function triggerFall(peak, tilt) {
   if (t - lastAlarm < 10000) return;     // 10초 내 중복 알림 방지
   lastAlarm = t;
   const time = new Date().toLocaleTimeString('ko-KR');
-  const info = `${time} · 최대 충격 ${peak.toFixed(1)}g · 기울기 ${Math.round(tilt)}°`;
+  raiseAlarm(`${time} · 최대 충격 ${peak.toFixed(1)}g · 기울기 ${Math.round(tilt)}°`);
+}
+
+function raiseAlarm(info) {
   log('낙상 감지 — ' + info);
   showAlarm(info);
   notify('⚠️ 낙상 감지!', info);
+}
+
+function enterDeviceMode() {
+  deviceMode = true;
+  $('devCards').hidden = false;
+  $('settings').hidden = true;
+  log('지팡이 판정 모드 (펌웨어가 낙상을 판단)');
 }
 
 // ---------- 알림 ----------
@@ -230,9 +270,17 @@ function showAlarm(info) {
   if (navigator.vibrate) navigator.vibrate([800, 300, 800, 300, 800]);
   beep(); clearInterval(beepTimer); beepTimer = setInterval(beep, 2000);
 }
-$('ack').onclick = () => {
+function clearAlarmUI() {
   $('alarm').hidden = true; clearInterval(beepTimer);
   if (navigator.vibrate) navigator.vibrate(0);
+}
+$('ack').onclick = async () => {
+  clearAlarmUI();
+  // 지팡이의 LED·부저도 함께 끈다 (펌웨어가 'r'을 받으면 NORMAL로 복귀)
+  if (deviceMode && rxChar) {
+    try { await rxChar.writeValue(new TextEncoder().encode('r')); log('지팡이 경보 해제 전송'); }
+    catch (e) { log('해제 전송 실패: ' + e.message); }
+  }
 };
 
 function beep() {
@@ -263,10 +311,12 @@ function draw() {
   ctx.clearRect(0, 0, W, H);
   ctx.strokeStyle = '#2a2e36'; ctx.lineWidth = 1;
   for (let g = 1; g < 6; g++) { const y = H - g / 6 * H; ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(W, y); ctx.stroke(); }
-  // 충격 기준선
-  ctx.strokeStyle = '#ff453a'; ctx.setLineDash([5, 4]);
-  const yTh = H - impactTh / 6 * H; ctx.beginPath(); ctx.moveTo(0, yTh); ctx.lineTo(W, yTh); ctx.stroke();
-  ctx.setLineDash([]);
+  // 충격 기준선 (지팡이 판정 모드에서는 펌웨어 값이라 표시하지 않음)
+  if (!deviceMode) {
+    ctx.strokeStyle = '#ff453a'; ctx.setLineDash([5, 4]);
+    const yTh = H - impactTh / 6 * H; ctx.beginPath(); ctx.moveTo(0, yTh); ctx.lineTo(W, yTh); ctx.stroke();
+    ctx.setLineDash([]);
+  }
   line(histT, 180, '#ffb340');
   line(histA, 6, '#4da3ff');
   requestAnimationFrame(draw);
